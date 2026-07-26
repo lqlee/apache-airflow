@@ -1,0 +1,137 @@
+# ── Apache Airflow 3.x — Local Development Stack ─────────────────────────────
+#
+# Lightweight single-node setup for local testing and side-by-side comparison
+# with airflow-nodejs. Uses LocalExecutor + SQLite (no Redis/Celery needed).
+#
+# Usage:
+#   docker-compose -f docker-compose.local.yml up -d
+#   docker-compose -f docker-compose.local.yml down
+#   docker-compose -f docker-compose.local.yml down -v   # wipe data
+#
+# First run (pulls image + initialises DB, ~2-3 min):
+#   docker-compose -f docker-compose.local.yml up airflow-init
+#   docker-compose -f docker-compose.local.yml up -d
+#
+# API:  http://localhost:8080          (user: airflow / password: airflow)
+# Docs: http://localhost:8080/api/v2/openapi.json
+#
+# Runs alongside airflow-nodejs (default port 3000) for direct comparison.
+#
+# Image note: pulled via Walmart Artifactory mirror.
+# Pre-pull (optional, avoids first-run delay):
+#   docker pull generic.ci.artifacts.walmart.com/hub-docker-release-remote/apache/airflow:3.0.0
+#
+# Platform:
+#   Default: auto-detected by Docker Desktop.
+#   Force x86:  AIRFLOW_PLATFORM=linux/amd64 docker-compose -f docker-compose.local.yml up
+#   Force ARM:  AIRFLOW_PLATFORM=linux/arm64 docker-compose -f docker-compose.local.yml up
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE:-generic.ci.artifacts.walmart.com/hub-docker-release-remote/apache/airflow:3.0.0}
+  platform: ${AIRFLOW_PLATFORM:-}
+  environment:
+    &airflow-env
+    # LocalExecutor — no Redis/Celery needed; tasks run as subprocesses
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # SQLite — zero setup; swap for postgres connection string if needed
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/db/airflow.db
+    # Disable example dags to keep things clean
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    # API server
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://localhost:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-local_dev_secret_change_me}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    # Logging — local filesystem
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    # Scheduler health check
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # SimpleAuthManager (Airflow 3.x):
+    # - Define users as "username:ROLE" (roles: ADMIN, OP, USER, VIEWER)
+    # - Point to our passwords file so the password stays stable across restarts
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: 'airflow:ADMIN'
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/config/passwords.json
+    # Disable auth for easy local access (re-enable for any shared environment)
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+  volumes:
+    - ./dags:/opt/airflow/dags                    # mount local dags/ for easy authoring
+    - ./airflow-config:/opt/airflow/config        # passwords.json + airflow.cfg overrides
+    - airflow-logs:/opt/airflow/logs
+    - airflow-db:/opt/airflow/db                  # only SQLite db file, not all of /opt/airflow
+  user: "${AIRFLOW_UID:-50000}:0"
+
+
+services:
+
+  # ── DB init + credentials setup (run once) ───────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "==> Creating directories..."
+        mkdir -p /opt/airflow/config /opt/airflow/db /opt/airflow/logs
+        echo "==> Writing static credentials (airflow / airflow)..."
+        # SimpleAuthManager reads credentials from JSON: {"username": "password"}
+        # Pre-seeding the file prevents the random-password generation on first start.
+        # The username must match SIMPLE_AUTH_MANAGER_USERS (set to 'airflow:ADMIN').
+        echo '{"airflow": "airflow"}' > /opt/airflow/config/passwords.json
+        chmod 600 /opt/airflow/config/passwords.json
+        chown -R ${AIRFLOW_UID:-50000}:0 /opt/airflow/config /opt/airflow/db /opt/airflow/logs
+        echo "==> Initialising Airflow database..."
+        airflow db migrate
+        # Ensure DB file is writable by airflow user (uid 50000) and group
+        chmod -R g+rw /opt/airflow/db/ 2>/dev/null || true
+        echo "==> Done."
+        echo ""
+        echo "Login: http://localhost:8080  user: airflow  password: airflow"
+    environment:
+      <<: *airflow-env
+    user: "0:0"   # root needed for mkdir/chown
+
+  # ── API server (port 8080) ─────────────────────────────────────────────────
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "-s", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Scheduler ─────────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Dag file processor (parses dags/ and updates DB) ──────────────────────
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+
+volumes:
+  airflow-logs:
+  airflow-db:
