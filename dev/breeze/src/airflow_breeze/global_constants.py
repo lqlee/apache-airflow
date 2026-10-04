@@ -20,6 +20,7 @@ Global constants that are used by all other Breeze components.
 
 from __future__ import annotations
 
+import json
 import platform
 import re
 from enum import Enum
@@ -32,6 +33,7 @@ from airflow_breeze.utils.path_utils import (
     AIRFLOW_CTL_SOURCES_PATH,
     AIRFLOW_ROOT_PATH,
     AIRFLOW_TASK_SDK_SOURCES_PATH,
+    MYPY_SOURCES_PATH,
 )
 
 PUBLIC_AMD_RUNNERS = '["ubuntu-22.04"]'
@@ -87,6 +89,7 @@ TESTABLE_PROVIDERS_INTEGRATIONS = [
     "cassandra",
     "drill",
     "elasticsearch",
+    "opensearch",
     "tinkerpop",
     "kafka",
     "localstack",
@@ -118,6 +121,7 @@ TESTABLE_PROVIDERS_INTEGRATION_OWNERS = {
     "cassandra": "apache.cassandra",
     "drill": "apache.drill",
     "elasticsearch": "elasticsearch",
+    "opensearch": "opensearch",
     "tinkerpop": "apache.tinkerpop",
     "kafka": "apache.kafka",
     "localstack": "amazon",
@@ -135,7 +139,7 @@ OTEL_INTEGRATION = "otel"
 OPENLINEAGE_INTEGRATION = "openlineage"
 OPENSEARCH_INTEGRATION = "opensearch"
 OTHER_CORE_INTEGRATIONS = [STATSD_INTEGRATION, KEYCLOAK_INTEGRATION]
-OTHER_PROVIDERS_INTEGRATIONS = [OPENLINEAGE_INTEGRATION, OPENSEARCH_INTEGRATION]
+OTHER_PROVIDERS_INTEGRATIONS = [OPENLINEAGE_INTEGRATION]
 ALLOWED_DEBIAN_VERSIONS = ["bookworm"]
 ALL_CORE_INTEGRATIONS = sorted(
     [
@@ -183,19 +187,8 @@ ALLOWED_DOCKER_COMPOSE_PROJECTS = [
     "docker-compose",
 ]
 
-# Every docker compose project name that any breeze command, prek hook, or
-# CI workflow uses. `breeze down` discovers running compose projects via the
-# `com.docker.compose.project` label and only touches the ones that match
-# either an exact entry in `KNOWN_DOCKER_COMPOSE_PROJECT_NAMES` or one of the
-# prefixes in `KNOWN_DOCKER_COMPOSE_PROJECT_PREFIXES`. When you add a new
-# project_name pattern anywhere (new breeze command, new prek hook, new CI
-# step), update this list so `breeze down` stays a one-shot cleanup.
-KNOWN_DOCKER_COMPOSE_PROJECT_NAMES = [
-    "breeze",  # default `breeze shell` / `breeze start-airflow`
-]
-KNOWN_DOCKER_COMPOSE_PROJECT_PREFIXES = [
-    "breeze-",  # breeze-registry-*, breeze-backfill-*, *-run-*
-]
+KNOWN_DOCKER_COMPOSE_PROJECT_NAMES = ["breeze"]
+KNOWN_DOCKER_COMPOSE_PROJECT_PREFIXES = ["breeze-"]
 ALLOWED_LOG_LEVELS = ["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"]
 DEFAULT_LOG_LEVEL = ALLOWED_LOG_LEVELS[0]
 
@@ -204,7 +197,15 @@ DEFAULT_LOG_LEVEL = ALLOWED_LOG_LEVELS[0]
 #   - https://endoflife.date/amazon-eks
 #   - https://endoflife.date/azure-kubernetes-service
 #   - https://endoflife.date/google-kubernetes-engine
-ALLOWED_KUBERNETES_VERSIONS = ["v1.30.13", "v1.31.12", "v1.32.8", "v1.33.4", "v1.34.0", "v1.35.0"]
+ALLOWED_KUBERNETES_VERSIONS = [
+    "v1.31.12",
+    "v1.32.11",
+    "v1.33.12",
+    "v1.34.11",
+    "v1.35.8",
+    "v1.36.4",
+    "v1.37.0",
+]
 
 LOCAL_EXECUTOR = "LocalExecutor"
 KUBERNETES_EXECUTOR = "KubernetesExecutor"
@@ -222,22 +223,23 @@ ALLOWED_EXECUTORS = [
 SIMPLE_AUTH_MANAGER = "SimpleAuthManager"
 FAB_AUTH_MANAGER = "FabAuthManager"
 
-GOLANG_WORKER = "go"
-
 JAVA_SDK = "java"
-ALLOWED_SDKS = [JAVA_SDK]
+TYPESCRIPT_SDK = "typescript"
+ALLOWED_SDKS = [JAVA_SDK, TYPESCRIPT_SDK]
 
 # JDK version used to build the Java SDK and its example bundles (e.g. the lang-SDK k8s system test).
 # Keep in sync with the toolchain the Java SDK Gradle build targets.
 JAVA_SDK_VERSION = "17"
+
+# Node image used to build the TypeScript SDK docs. Keep in sync with the ``engines.node``
+# requirement in ts-sdk/package.json.
+TYPESCRIPT_SDK_NODE_VERSION = "22"
 
 DEFAULT_ALLOWED_EXECUTOR = ALLOWED_EXECUTORS[0]
 ALLOWED_AUTH_MANAGERS = [SIMPLE_AUTH_MANAGER, FAB_AUTH_MANAGER]
 START_AIRFLOW_ALLOWED_EXECUTORS = [LOCAL_EXECUTOR, CELERY_EXECUTOR, EDGE_EXECUTOR]
 START_AIRFLOW_DEFAULT_ALLOWED_EXECUTOR = START_AIRFLOW_ALLOWED_EXECUTORS[0]
 ALLOWED_CELERY_EXECUTORS = [CELERY_EXECUTOR, CELERY_K8S_EXECUTOR]
-ALLOWED_WORKER_TYPES = [GOLANG_WORKER]
-
 CONSTRAINTS_SOURCE_PROVIDERS = "constraints-source-providers"
 CONSTRAINTS = "constraints"
 CONSTRAINTS_NO_PROVIDERS = "constraints-no-providers"
@@ -297,8 +299,8 @@ if MYSQL_INNOVATION_RELEASE:
 
 ALLOWED_INSTALL_MYSQL_CLIENT_TYPES = ["mariadb"]
 
-PIP_VERSION = "26.1.2"
-UV_VERSION = "0.11.29"
+PIP_VERSION = "26.2.1"
+UV_VERSION = "0.12.18"
 
 # packages that providers docs
 REGULAR_DOC_PACKAGES = [
@@ -308,7 +310,9 @@ REGULAR_DOC_PACKAGES = [
     "apache-airflow-providers",
     "java-sdk",
     "task-sdk",
+    "ts-sdk",
     "apache-airflow-ctl",
+    "apache-airflow-mypy",
 ]
 
 
@@ -502,6 +506,7 @@ RABBITMQ_HOST_PORT = "25672"
 REDIS_HOST_PORT = "26379"
 RABBITMQ_HOST_PORT = "25672"
 SSH_PORT = "12322"
+SIMPLE_AUTH_MANAGER_VITE_DEV_PORT = "5174"
 VITE_DEV_PORT = "5173"
 WEB_HOST_PORT = "28080"
 BREEZE_DEBUG_SCHEDULER_PORT = "50231"
@@ -514,7 +519,9 @@ BREEZE_DEBUG_WEBSERVER_PORT = "50237"
 
 CELERY_BROKER_URLS_MAP = {"rabbitmq": "amqp://guest:guest@rabbitmq:5672", "redis": "redis://redis:6379/0"}
 SQLITE_URL = "sqlite:////root/airflow/sqlite/airflow.db"
-PYTHONDONTWRITEBYTECODE = True
+# Bytecode cache lives outside the mounted sources so it never pollutes the host checkout
+# and can be persisted in a docker volume across container runs (see pycache.yml).
+PYCACHE_PREFIX_IN_CONTAINER = "/root/.cache/airflow-pycache"
 
 PRODUCTION_IMAGE = False
 # All python versions include all past python versions available in previous branches
@@ -703,6 +710,19 @@ def get_airflowctl_version():
     return airflowctl_version
 
 
+def get_airflow_mypy_version():
+    mypy_init_py_file = MYPY_SOURCES_PATH / "airflow_mypy" / "__init__.py"
+    mypy_version = "unknown"
+    with open(mypy_init_py_file) as init_file:
+        while line := init_file.readline():
+            if "__version__ = " in line:
+                mypy_version = line.split()[2][1:-1]
+                break
+    if mypy_version == "unknown":
+        raise RuntimeError("Unable to determine Apache Airflow Mypy version")
+    return mypy_version
+
+
 def get_airflow_version():
     airflow_init_py_file = AIRFLOW_CORE_SOURCES_PATH / "airflow" / "__init__.py"
     airflow_version = "unknown"
@@ -736,6 +756,15 @@ def get_java_sdk_version() -> str:
         if match := re.match(r"^projectVersion\s*=\s*(\S+)$", line.strip()):
             return match.group(1)
     raise RuntimeError(f"Java SDK version not found in {props_path}")
+
+
+def get_ts_sdk_version() -> str:
+    """Read the TypeScript SDK version from 'ts-sdk/package.json'."""
+    package_json_path = AIRFLOW_ROOT_PATH / "ts-sdk" / "package.json"
+    version = json.loads(package_json_path.read_text()).get("version")
+    if not version:
+        raise RuntimeError(f"TypeScript SDK version not found in {package_json_path}")
+    return version
 
 
 @clearable_cache
@@ -773,13 +802,16 @@ FILES_FOR_REBUILD_CHECK = [
     "scripts/docker/install_mysql.sh",
 ]
 
+# Hash of FILES_FOR_REBUILD_CHECK contents, set on CI images so other checkouts can detect identical sources
+CI_IMAGE_SOURCES_HASH_LABEL = "org.apache.airflow.ci.sources-hash"
+
 CURRENT_KUBERNETES_VERSIONS = ALLOWED_KUBERNETES_VERSIONS
 CURRENT_EXECUTORS = [KUBERNETES_EXECUTOR]
 
 DEFAULT_KUBERNETES_VERSION = CURRENT_KUBERNETES_VERSIONS[0]
 DEFAULT_EXECUTOR = CURRENT_EXECUTORS[0]
 
-KIND_VERSION = "v0.31.0"
+KIND_VERSION = "v0.33.0"
 HELM_VERSION = "v3.19.0"
 SKAFFOLD_VERSION = "v2.17.0"
 
@@ -840,7 +872,7 @@ PROVIDERS_COMPATIBILITY_TESTS_MATRIX: list[dict[str, str | list[str]]] = [
     {
         "python-version": "3.10",
         "airflow-version": "2.11.1",
-        "remove-providers": "anthropic common.messaging common.dataquality edge3 fab git keycloak informatica common.ai opensearch",
+        "remove-providers": "anthropic common.messaging common.dataquality edge3 fab git keycloak informatica modal opensearch",
         "run-unit-tests": "true",
     },
     {
@@ -863,18 +895,18 @@ PROVIDERS_COMPATIBILITY_TESTS_MATRIX: list[dict[str, str | list[str]]] = [
     },
     {
         "python-version": "3.10",
-        "airflow-version": "3.3.0",
+        "airflow-version": "3.3.2",
         "remove-providers": "",
         "run-unit-tests": "true",
     },
 ]
 
 ALL_PYTHON_VERSION_TO_PATCHLEVEL_VERSION: dict[str, str] = {
-    "3.10": "3.10.20",
-    "3.11": "3.11.15",
-    "3.12": "3.12.13",
-    "3.13": "3.13.14",
-    "3.14": "3.14.3",
+    "3.10": "3.10.21",
+    "3.11": "3.11.16",
+    "3.12": "3.12.14",
+    "3.13": "3.13.15",
+    "3.14": "3.14.7",
 }
 
 # Number of slices for low dep tests

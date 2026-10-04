@@ -31,7 +31,7 @@ import sys
 import weakref
 from collections.abc import Collection, Iterable, Mapping
 from functools import cache, cached_property, lru_cache
-from inspect import signature
+from inspect import Parameter, signature
 from textwrap import dedent
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast, overload
 
@@ -112,8 +112,6 @@ from airflow.utils.db import LazySelectSequence
 from airflow.utils.sqlalchemy import deserialize_pod_dict
 
 if TYPE_CHECKING:
-    from inspect import Parameter
-
     from kubernetes.client import models as k8s  # noqa: TC004
     from kubernetes.client.api_client import ApiClient  # noqa: TC004
 
@@ -133,6 +131,8 @@ log = logging.getLogger(__name__)
 _CALLBACK_TYPES = ("execute", "failure", "success", "retry", "skipped")
 _OPERATOR_CALLBACK_FIELDS = frozenset(f"on_{x}_callback" for x in _CALLBACK_TYPES)
 _HAS_CALLBACK_FIELDS = frozenset(f"has_on_{x}_callback" for x in _CALLBACK_TYPES)
+_DAG_CALLBACK_FIELDS = frozenset({"has_on_success_callback", "has_on_failure_callback"})
+_OPERATOR_TIMEDELTA_FIELDS = frozenset({"retry_delay", "execution_timeout", "max_retry_delay"})
 # Fields whose value must never be serialized: the object has no serializer, so it would
 # fall back to str(obj) and leak a non-deterministic memory address (a new DagVersion every
 # parse). Only a boolean ``has_<field>`` flag is stored; the live object is recovered by
@@ -1063,6 +1063,20 @@ class OperatorSerialization(DAGNode, BaseSerialization):
         if op.inherits_from_skipmixin:
             serialize_op["_can_skip_downstream"] = True
 
+        if op.is_stub:
+            # Imported here, not at module scope: this pulls pydantic's JSON-schema machinery,
+            # which only lang-SDK (non-Python) workloads ever need.
+            from airflow.sdk.bases.decorator import DecoratedOperator
+            from airflow.serialization.stub_arg_bindings import build_arg_bindings
+
+            serialize_op["is_stub"] = True
+            if (
+                not op.is_mapped
+                and isinstance(op, DecoratedOperator)
+                and (arg_bindings := build_arg_bindings(op))
+            ):
+                serialize_op["_arg_bindings"] = arg_bindings
+
         if op.start_trigger_args:
             serialize_op["start_trigger_args"] = _encode_start_trigger_args(op.start_trigger_args)
 
@@ -1177,6 +1191,10 @@ class OperatorSerialization(DAGNode, BaseSerialization):
                     raise RuntimeError("_is_sensor=False should never have been serialized!")
                 object.__setattr__(op, "deps", op.deps | {ReadyToRescheduleDep()})
                 continue
+            elif k in ("is_stub", "_arg_bindings"):
+                # Both are restored unconditionally below: is_stub must fail closed rather than go
+                # through generic decoding, and _arg_bindings is plain JSON, not {__type, __var}.
+                continue
             elif (
                 k in cls._decorated_fields
                 or k not in op.get_serialized_fields()
@@ -1234,6 +1252,11 @@ class OperatorSerialization(DAGNode, BaseSerialization):
 
         # Used to determine if an Operator is inherited from SkipMixin
         setattr(op, "_can_skip_downstream", bool(encoded_op.get("_can_skip_downstream", False)))
+
+        # Fails closed like the Dag-level flag: a non-Python producer's blob is never schema-validated
+        # on this path, so anything that is not JSON ``true`` means "not a stub".
+        setattr(op, "is_stub", encoded_op.get("is_stub") is True)
+        setattr(op, "_arg_bindings", encoded_op.get("_arg_bindings"))
 
         start_trigger_args = None
         encoded_start_trigger_args = encoded_op.get("start_trigger_args", None)
@@ -1349,15 +1372,8 @@ class OperatorSerialization(DAGNode, BaseSerialization):
         return op
 
     @classmethod
-    def _preprocess_encoded_operator(cls, encoded_op: dict[str, Any]) -> dict[str, Any]:
-        """
-        Preprocess and upgrade all field names for backward compatibility and consistency.
-
-        This consolidates all field name transformations in one place:
-        - Callback field renaming (on_*_callback -> has_on_*_callback)
-        - Other field upgrades and renames
-        - Field exclusions
-        """
+    def _upgrade_encoded_operator(cls, encoded_op: dict[str, Any]) -> dict[str, Any]:
+        """Upgrade legacy field names while preserving serialized definition metadata."""
         preprocessed = encoded_op.copy()
 
         # Handle callback field renaming for backward compatibility
@@ -1380,6 +1396,13 @@ class OperatorSerialization(DAGNode, BaseSerialization):
         for old_name, new_name in field_renames.items():
             if old_name in preprocessed:
                 preprocessed[new_name] = preprocessed.pop(old_name)
+
+        return preprocessed
+
+    @classmethod
+    def _preprocess_encoded_operator(cls, encoded_op: dict[str, Any]) -> dict[str, Any]:
+        """Upgrade operator fields and exclude metadata unused by runtime hydration."""
+        preprocessed = cls._upgrade_encoded_operator(encoded_op)
 
         # Remove fields that shouldn't be processed
         fields_to_exclude = {
@@ -1609,7 +1632,7 @@ class OperatorSerialization(DAGNode, BaseSerialization):
             return set(value) if value is not None else set()
         elif field_name in _HAS_CALLBACK_FIELDS:
             return bool(value)
-        elif field_name in {"retry_delay", "execution_timeout", "max_retry_delay"}:
+        elif field_name in _OPERATOR_TIMEDELTA_FIELDS:
             # Reuse existing timedelta deserialization logic
             if value is not None:
                 return cls._deserialize_timedelta(value)
@@ -1755,10 +1778,9 @@ class DagSerialization(BaseSerialization):
             serialized_dag["params"] = cls._serialize_params_dict(dag.params)
 
             # has_on_*_callback are only stored if the value is True, as the default is False
-            if dag.has_on_success_callback:
-                serialized_dag["has_on_success_callback"] = True
-            if dag.has_on_failure_callback:
-                serialized_dag["has_on_failure_callback"] = True
+            for field in _DAG_CALLBACK_FIELDS:
+                if getattr(dag, field):
+                    serialized_dag[field] = True
 
             # TODO: Move this logic to a better place -- ideally before serializing contents of default_args.
             #   There is some duplication with this and SerializedBaseOperator.partial_kwargs serialization.
@@ -1881,10 +1903,9 @@ class DagSerialization(BaseSerialization):
                 tg.add(task)
 
         # Set has_on_*_callbacks to True if they exist in Serialized blob as False is the default
-        if "has_on_success_callback" in encoded_dag:
-            dag.has_on_success_callback = True
-        if "has_on_failure_callback" in encoded_dag:
-            dag.has_on_failure_callback = True
+        for field in _DAG_CALLBACK_FIELDS:
+            if field in encoded_dag:
+                setattr(dag, field, True)
 
         dag.deadline = encoded_dag.get("deadline")
 

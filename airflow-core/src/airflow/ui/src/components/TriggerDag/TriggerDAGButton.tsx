@@ -16,15 +16,19 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { useState } from "react";
+
 import { Box, Button, useDisclosure } from "@chakra-ui/react";
 import type { DagRunType } from "openapi-gen/requests/types.gen";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FiPlay } from "react-icons/fi";
 import { useParams } from "react-router-dom";
 
 import { useDagRunServiceGetDagRun } from "openapi/queries";
-import { IconButton, Menu, Tooltip } from "src/components/ui";
+
+import { IconButton, Menu, Tooltip } from "src/system-components";
+
+import { hasDagRunConfig } from "src/utils";
 
 import TriggerDAGModal from "./TriggerDAGModal";
 
@@ -90,8 +94,9 @@ export const TriggerDAGButton = ({
     onClose();
   };
 
-  // If there's a selected DAG Run with config, show menu with options
-  if (selectedDagRun?.conf !== undefined) {
+  // If the selected Dag run carries a non-empty config, show the menu with options. A run triggered
+  // without a config comes back as an empty object `{}`, which must not count as "has config".
+  if (hasDagRunConfig(selectedDagRun?.conf)) {
     return (
       <Box>
         <Menu.Root>

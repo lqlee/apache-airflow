@@ -27,6 +27,7 @@ import pytest
 
 from airflow.sdk import (
     DAG,
+    Asset,
     Context,
     Label,
     Param,
@@ -185,9 +186,7 @@ class TestDag:
             if len(role_access_control_entry) > 0
             else role_access_control_entry
         )
-        with pytest.warns(
-            RemovedInAirflow4Warning, match=re.escape("The airflow.security.permissions module is deprecated")
-        ):
+        with pytest.warns(RemovedInAirflow4Warning, match=re.escape("DAG.access_control is deprecated")):
             _ = DAG("should-warn-dag", access_control=access_control, schedule=None, start_date=DEFAULT_DATE)
 
     def test_params_not_passed_is_empty_dict(self):
@@ -640,12 +639,23 @@ def test_allowed_run_types_conflicting_schedule(schedule, allowed_run_types, mat
 
 
 def test_allowed_run_types_asset_triggered_missing_with_asset_schedule():
-    from airflow.sdk.definitions.asset import Asset
-
     with pytest.raises(ValueError, match="allowed_run_types must include ASSET_TRIGGERED"):
         DAG(
             "test-allowed-asset",
             schedule=[Asset("test")],
+            allowed_run_types=[DagRunType.MANUAL],
+        )
+
+
+def test_allowed_run_types_uses_asset_triggered_behavior():
+    class CustomAssetTriggeredTimetable(BaseTimetable):
+        asset_triggered = True
+        asset_condition = Asset("test")
+
+    with pytest.raises(ValueError, match="allowed_run_types must include ASSET_TRIGGERED"):
+        DAG(
+            "test-allowed-custom-asset",
+            schedule=CustomAssetTriggeredTimetable(),
             allowed_run_types=[DagRunType.MANUAL],
         )
 
@@ -891,6 +901,8 @@ class TestCycleTester:
             create_cluster >> pod_task >> delete_cluster
             create_cluster >> pod_task_xcom >> delete_cluster
             pod_task_xcom >> pod_task_xcom_result
+
+        assert not dag.check_cycle()
 
     def test_cycle_no_cycle(self):
         # test no cycle

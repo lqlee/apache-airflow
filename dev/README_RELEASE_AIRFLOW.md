@@ -388,7 +388,7 @@ export AIRFLOW_REPO_ROOT=$(pwd)
 ```
 
 - Install `breeze` command (recommended — installs a shim at `~/.local/bin/breeze` that runs
-  breeze via `uvx` from the current git worktree's `dev/breeze`; see
+  breeze via `uv run --locked` from the current git worktree's `dev/breeze`; see
   [ADR 0017](breeze/doc/adr/0017-use-uvx-to-run-breeze-from-local-sources.md)):
 
 ```shell script
@@ -461,7 +461,8 @@ still works but is no longer recommended.
   - Update the Task SDK version `>=` part in `pyproject.toml` to `==` TASK_SDK_VERSION without RC
 - Run `git commit` without a message to update versions in `docs`.
 - Add supported Airflow version to `./scripts/ci/prek/supported_versions.py` and let prek do the job again.
-- Replace the versions in `README.md` about installation and verify that installation instructions work fine.
+  The `update-supported-versions` hook also rewrites the "Stable version" header and the installation
+  `pip install` / constraints pins in `README.md` - verify that installation instructions work fine.
 - Update the build status badge in `README.md` to point to the new `vX-Y-test` branch (the `3.x` row in the
   build status table). The `uv run dev/update_github_branch_config.py X Y` script does this automatically.
 - Add entry for default python version to `PROVIDERS_COMPATIBILITY_TESTS_MATRIX` in `src/airflow_breeze/global_constants.py`
@@ -639,6 +640,29 @@ you need to run several workflows to publish the documentation. More details abo
 emergency cases.
 
 We have two options publishing the documentation 1. Using breeze commands 2. Manually using GitHub Actions.:
+
+### Sync staging with main (skip if another vote is in progress)
+
+Before publishing the staging docs, reset the `staging` branches of
+[`apache/airflow-site`](https://github.com/apache/airflow-site) and
+[`apache/airflow-site-archive`](https://github.com/apache/airflow-site-archive) to `main`, so the staging
+site starts from the current live site rather than from whatever an earlier release left there:
+
+```shell script
+breeze workflow-run sync-staging-to-main
+```
+
+It triggers the `Reset staging to main` workflow in
+[`airflow-site`](https://github.com/apache/airflow-site/actions/workflows/reset-staging.yml) and in
+[`airflow-site-archive`](https://github.com/apache/airflow-site-archive/actions/workflows/reset-staging.yml).
+Each force-updates its repository's `staging` branch to the current `main` commit (`main` itself is not
+changed); in `airflow-site` it also rebuilds the staging site.
+
+> [!WARNING]
+> **Skip this step if a vote for any other release (Airflow, Providers, Helm Chart, airflowctl, ...) is
+> in progress.** Its release candidate docs are on the `staging` branches, and resetting `staging` to `main`
+> would overwrite the staging docs prepared for that vote. The command asks for confirmation before it
+> does anything; answer `n` to skip it.
 
 ### Using breeze commands
 
@@ -1406,15 +1430,22 @@ breeze workflow-run release-constraints --version ${VERSION} --ref v3-1-stable
 The workflow derives the stage from `--version` alone, so there is no separate switch that could
 disagree with the version:
 
-| `--version` | Pre-releases | Lands on | Tagged |
+| `--version` | Provider pins | Lands on | Tagged |
 |---|---|---|---|
-| `3.1.3rc1` | providers only | `constraints-3.1.3rc1`, branched off `constraints-3-1` | `constraints-3.1.3rc1` |
-| `3.1.3` | none | `constraints-3-1` (commit) | `constraints-3.1.3` |
+| `3.3.1rc1` | newest in PyPI, `rcN` included | `constraints-3.3.1rc1`, branched off `constraints-3-3` | `constraints-3.3.1rc1` |
+| `3.3.1` | newest final in PyPI | `constraints-3-3` (commit) | `constraints-3.3.1` |
 
-"Providers only" is literal: the resolution names every `apache-airflow-providers-*` with a
-pre-release lower bound and runs under uv's `explicit` strategy, which permits a pre-release solely
-for a package marked that way. Nothing else in the dependency graph can resolve to one — which is
-why `--pre` is not used, since it would apply to the whole resolution.
+The providers are pinned rather than resolved: every `apache-airflow-providers-*` is named with
+`==` at the newest version PyPI can install, so the constraints record what is actually published
+instead of whatever the resolver settles on. A candidate takes the wave's `rcN` versions along with
+it - a pre-release only wins by sorting above every final release, so a provider without a
+candidate in the wave keeps its release. A final ignores candidates entirely, which is what makes
+it impossible for a released constraints file to carry an `rc` pin. Nothing else in the dependency
+graph can resolve to a pre-release, since no other requirement mentions one.
+
+Re-running the workflow for the same candidate deletes and re-creates that candidate's branch and
+tag, so redoing a candidate's constraints just works. A final is never treated this way - it commits
+onto the shared `constraints-X-Y` branch, whose history everything downstream reads.
 
 
 4. Make sure to update Airflow version in ``v3-*-test`` branch after cherry-picking to X.Y.1 in
@@ -1650,7 +1681,8 @@ If you don't have access to the account ask a PMC member to post.
 
 This includes:
 
-- Modify `./scripts/ci/prek/supported_versions.py` and let prek do the job.
+- Modify `./scripts/ci/prek/supported_versions.py` and let prek do the job (it also updates the stable
+  version pins in the `README.md` installation instructions).
 - For major/minor release, update version in `airflow/__init__.py` and `docker-stack-docs/` to the next likely major version release.
   - New version should be, current major release + 1.0
 - Sync `RELEASE_NOTES.rst` (including deleting relevant `newsfragments`) and `README.md` changes.
