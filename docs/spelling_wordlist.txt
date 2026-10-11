@@ -840,6 +840,7 @@ ideation
 idempotence
 idempotency
 IdP
+idp
 ie
 iframe
 iframes
@@ -971,6 +972,7 @@ kerberized
 Kerberos
 kerberos
 KerberosClient
+Kev
 keycloak
 Keyfile
 keyfile
@@ -1493,6 +1495,7 @@ rollup
 rom
 romeoandjuliet
 rootcss
+routable
 rowid
 rpc
 rsa
