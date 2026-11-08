@@ -892,6 +892,34 @@ class TestDagBag:
         assert len(dagbag.import_errors) == 1
         assert len(dagbag.dags) == 0
 
+    @pytest.mark.parametrize("batch_asset_events", [False, True])
+    @pytest.mark.parametrize("explicit", [False, None])
+    def test_process_file_compound_assets_require_batching(self, tmp_path, batch_asset_events, explicit):
+        dag_file = tmp_path / "compound_assets.py"
+        batching_argument = "" if explicit is None else f", batch_asset_events={explicit!r}"
+        dag_file.write_text(
+            textwrap.dedent(
+                f"""
+                from airflow.sdk import DAG, Asset, PartitionedAssetTimetable
+
+                with DAG("compound_assets", schedule=PartitionedAssetTimetable(
+                    Asset("a") & Asset("b"){batching_argument}
+                )):
+                    pass
+                """
+            )
+        )
+        with conf_vars({("scheduler", "batch_asset_events"): str(batch_asset_events)}):
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path))
+        if explicit is None:
+            assert not dagbag.import_errors
+            assert "compound_assets" in dagbag.dags
+        else:
+            assert not dagbag.dags
+            assert list(dagbag.import_errors.values()) == [
+                "AirflowTimetableInvalid: Asset AND conditions require batch_asset_events=True"
+            ]
+
     def test_process_file_invalid_param_check(self, tmp_path):
         """
         test if an invalid param in the dags can be identified
@@ -1630,6 +1658,15 @@ def _recorded_payloads() -> list:
 @pytest.mark.parametrize("data", _recorded_payloads())
 def test_recorded_runtime_payloads_are_valid(data):
     DagSerialization.validate_serialized_dag(data)
+
+
+@pytest.mark.parametrize("data", _recorded_payloads())
+def test_recorded_runtime_payloads_mark_their_tasks_as_stubs(data):
+    """ti_run derives arg_bindings only for a stub task, and a language runtime runs every task of a
+    Dag defined in it, a TriggerDagRun one included, so each has to say so."""
+    dag = DagSerialization.from_dict(data)
+    for task_id, task in dag.task_dict.items():
+        assert task.is_stub, task_id
 
 
 def _serialize_native_dag(dag_id: str, fileloc: str, relative_fileloc: str) -> dict:
