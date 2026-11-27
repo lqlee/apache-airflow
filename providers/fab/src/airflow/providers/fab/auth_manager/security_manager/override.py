@@ -85,6 +85,7 @@ from airflow.providers.fab.auth_manager.models import (
 )
 from airflow.providers.fab.auth_manager.models.anonymous_user import AnonymousUser
 from airflow.providers.fab.auth_manager.security_manager.constants import EXISTING_ROLES
+from airflow.providers.fab.auth_manager.security_manager.passwords import is_empty_password
 from airflow.providers.fab.auth_manager.views.auth_login import CustomAuthDBView, CustomAuthLDAPView
 from airflow.providers.fab.auth_manager.views.auth_oauth import CustomAuthOAuthView
 from airflow.providers.fab.auth_manager.views.permissions import (
@@ -621,7 +622,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         Nothing is committed: the caller persists both changes together, normally with
         ``update_user``.
         """
-        user.password = self._hash_password(password)
+        user.password = None if is_empty_password(password) else self._hash_password(password)
         # Incremented in SQL so that concurrent password changes cannot write the same value.
         user.token_generation = self.user_model.token_generation + 1
 
@@ -1067,10 +1068,27 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
              is a set() of action names (e.g., `{'DAG Runs': {'can_create'}, 'DAGs': {'can_read'}}`)
         :return:
         """
-        for resource_name, resource_values in self.RESOURCE_DETAILS_MAP.items():
-            dag_resource_name = permissions.resource_name(dag_id, resource_name)
-            for dag_action_name in resource_values["actions"]:
-                self.create_permission(dag_action_name, dag_resource_name)
+        expected = {
+            (action_name, permissions.resource_name(dag_id, resource_type))
+            for resource_type, resource_values in self.RESOURCE_DETAILS_MAP.items()
+            for action_name in resource_values["actions"]
+        }
+        existing = set(
+            self.session.execute(
+                select(self.action_model.name, self.resource_model.name)
+                .select_from(self.permission_model)
+                .join(self.permission_model.action)
+                .join(self.permission_model.resource)
+                .where(
+                    # Filtering on action names too lets SQLite use the UNIQUE (permission_id, view_menu_id)
+                    # index; with resource names alone it scans the whole ab_permission_view table.
+                    self.action_model.name.in_({action_name for action_name, _ in expected}),
+                    self.resource_model.name.in_({resource_name for _, resource_name in expected}),
+                )
+            ).all()
+        )
+        for action_name, resource_name in expected - existing:
+            self.create_permission(action_name, resource_name)
 
         if access_control is not None:
             self.log.debug("Syncing DAG-level permissions for DAG '%s'", dag_id)
@@ -1587,6 +1605,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             user.groups = groups or []
             if hashed_password:
                 user.password = hashed_password
+            elif is_empty_password(password):
+                user.password = None
             else:
                 user.password = self._hash_password(password)
             self.session.commit()
@@ -1656,6 +1676,8 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         register_user.last_name = last_name
         if hashed_password:
             register_user.password = hashed_password
+        elif is_empty_password(password):
+            register_user.password = None
         else:
             register_user.password = self._hash_password(password)
         register_user.registration_hash = str(uuid.uuid4())
@@ -2285,6 +2307,18 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             log.error(e)
             return None
 
+    def _verify_password(self, user: User, password: str) -> bool:
+        """
+        Return whether the password matches the user's stored password.
+
+        An empty password, or a user without a stored password, never matches, and still runs
+        the fake hash check.
+        """
+        if user.password is None or is_empty_password(password):
+            check_password_hash(current_app.config["AUTH_DB_FAKE_PASSWORD_HASH_CHECK"], "password")
+            return False
+        return check_password_hash(user.password, password)
+
     def check_password(self, username, password) -> bool:
         """
         Check if the password is correct for the username.
@@ -2295,9 +2329,7 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
         user = self.find_user(username=username)
         if user is None:
             user = self.find_user(email=username)
-        if user is None or user.password is None:
-            return False
-        return check_password_hash(user.password, password)
+        return user is not None and self._verify_password(user, password)
 
     def auth_user_db(self, username, password, rotate_session_id=True) -> User | None:
         """
@@ -2323,14 +2355,16 @@ class FabAirflowSecurityManagerOverride(AirflowSecurityManagerV2):
             )
             log.info(LOGMSG_WAR_SEC_LOGIN_FAILED, username)
             return None
-        if user.password is None:
-            return None
-        if check_password_hash(user.password, password):
+        if self._verify_password(user, password):
             if rotate_session_id:
                 self._rotate_session_id()
             self.update_user_auth_stat(user, True)
             return user
-        self.update_user_auth_stat(user, False)
+        # A user without a local password has nothing to guess here. When auth_user_db is a
+        # fallback after another method, as in basic_auth with LDAP, that method has already
+        # counted the failure.
+        if user.password is not None:
+            self.update_user_auth_stat(user, False)
         log.info(LOGMSG_WAR_SEC_LOGIN_FAILED, username)
         return None
 
